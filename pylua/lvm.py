@@ -27,7 +27,7 @@ from .llimits import (
     luai_numlt, luai_numle, luai_numeq,
 )
 from .lobject import (
-    TValue, Value, Proto, LClosure, Table,
+    TValue, Value, Proto, LClosure, Table, UpValRef,
     ttisinteger, ttisfloat, ttisnumber, ttisstring, ttisnil,
     ttistable, ttisfunction, ttisLclosure, ttisCclosure,
     ivalue, fltvalue, nvalue, tsvalue, hvalue,
@@ -61,6 +61,53 @@ def cvt2num(o: TValue) -> bool:
 
 # lvm.h:36-37 - Floor to integer conversion mode
 LUA_FLOORN2I: int = 0  # lvm.h:36
+
+
+# =============================================================================
+# UpValue Helper Functions (for handling UpValRef)
+# =============================================================================
+
+def _get_upval_value(L: 'LuaState', uv: 'UpVal') -> TValue:
+    """
+    Get the TValue from an upvalue, handling both legacy int and UpValRef.
+    
+    Args:
+        L: Lua state (for stack access)
+        uv: UpVal object
+    
+    Returns:
+        TValue - the actual value
+    """
+    if isinstance(uv.v, UpValRef):
+        if uv.v.is_open:
+            return L.stack[uv.v.stack_index]
+        else:
+            return uv.v.tvalue
+    elif isinstance(uv.v, int):
+        return L.stack[uv.v]
+    else:
+        return uv.v if uv.v is not None else uv.value
+
+
+def _set_upval_value(L: 'LuaState', uv: 'UpVal', val: TValue) -> None:
+    """
+    Set the value of an upvalue, handling both legacy int and UpValRef.
+    
+    Args:
+        L: Lua state (for stack access)
+        uv: UpVal object
+        val: Value to set
+    """
+    if isinstance(uv.v, UpValRef):
+        if uv.v.is_open:
+            setobj(L, L.stack[uv.v.stack_index], val)
+        else:
+            setobj(L, uv.v.tvalue, val)
+    elif isinstance(uv.v, int):
+        setobj(L, L.stack[uv.v], val)
+    else:
+        target = uv.v if uv.v is not None else uv.value
+        setobj(L, target, val)
 
 
 # =============================================================================
@@ -881,18 +928,13 @@ def luaV_execute(L: 'LuaState') -> None:
             elif op == OpCode.OP_GETUPVAL:  # lvm.c:831-835
                 b = GETARG_B(i)
                 uv = cl.upvals[b]
-                if isinstance(uv.v, int):
-                    setobj2s(L, L.stack[ra], L.stack[uv.v])
-                else:
-                    setobj2s(L, L.stack[ra], uv.v)
+                upval = _get_upval_value(L, uv)
+                setobj2s(L, L.stack[ra], upval)
             
             elif op == OpCode.OP_GETTABUP:  # lvm.c:836-841
                 b = GETARG_B(i)
                 uv = cl.upvals[b]
-                if isinstance(uv.v, int):
-                    upval = L.stack[uv.v]
-                else:
-                    upval = uv.v
+                upval = _get_upval_value(L, uv)
                 rc = _RKC(L, i, base, k)
                 _gettable(L, upval, rc, ra)
             
@@ -904,10 +946,7 @@ def luaV_execute(L: 'LuaState') -> None:
             elif op == OpCode.OP_SETTABUP:  # lvm.c:848-854
                 a = GETARG_A(i)
                 uv = cl.upvals[a]
-                if isinstance(uv.v, int):
-                    upval = L.stack[uv.v]
-                else:
-                    upval = uv.v
+                upval = _get_upval_value(L, uv)
                 rb = _RKB(L, i, base, k)
                 rc = _RKC(L, i, base, k)
                 _settable(L, upval, rb, rc)
@@ -915,10 +954,7 @@ def luaV_execute(L: 'LuaState') -> None:
             elif op == OpCode.OP_SETUPVAL:  # lvm.c:855-859
                 b = GETARG_B(i)
                 uv = cl.upvals[b]
-                if isinstance(uv.v, int):
-                    setobj(L, L.stack[uv.v], L.stack[ra])
-                else:
-                    setobj(L, uv.v, L.stack[ra])
+                _set_upval_value(L, uv, L.stack[ra])
             
             elif op == OpCode.OP_SETTABLE:  # lvm.c:861-866
                 rb = _RKB(L, i, base, k)
@@ -1643,18 +1679,26 @@ def _findupval(L: 'LuaState', level: int) -> 'UpVal':
     """
     Find or create an upvalue pointing to stack level
     """
-    from .lobject import UpVal
+    from .lobject import UpVal, UpValRef
+    
+    # Helper to get stack index from upvalue
+    def get_stack_index(uv):
+        if isinstance(uv.v, UpValRef):
+            return uv.v.stack_index if uv.v.is_open else -1
+        elif isinstance(uv.v, int):
+            return uv.v
+        return -1
     
     # Search existing open upvalues
     pp = L.openupval
     while pp is not None:
-        if isinstance(pp.v, int) and pp.v == level:
+        if get_stack_index(pp) == level:
             return pp
         pp = getattr(pp, 'next', None)
     
-    # Create new upvalue
+    # Create new upvalue with UpValRef for type safety
     uv = UpVal()
-    uv.v = level  # Points to stack slot
+    uv.v = UpValRef.from_stack(level)  # Points to stack slot
     uv.refcount = 1
     uv.next = L.openupval
     L.openupval = uv

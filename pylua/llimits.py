@@ -247,37 +247,55 @@ def cast_uchar(i: int) -> int:
 # llimits.h:120-132 - Signed/Unsigned Integer Conversion
 # =============================================================================
 
+# 64-bit integer bounds for two's complement arithmetic
+_LUA_INTEGER_BITS = 64
+_LUA_UNSIGNED_MAX = (1 << _LUA_INTEGER_BITS) - 1  # 0xFFFFFFFFFFFFFFFF
+_LUA_INTEGER_MAX = (1 << (_LUA_INTEGER_BITS - 1)) - 1  # 0x7FFFFFFFFFFFFFFF
+_LUA_INTEGER_MIN = -(1 << (_LUA_INTEGER_BITS - 1))  # -0x8000000000000000
+
+
 def l_castS2U(i: int) -> int:
     """
     llimits.h:122 - cast a signed lua_Integer to lua_Unsigned
     
+    #define l_castS2U(i) ((lua_Unsigned)(i))
+    
+    Converts signed 64-bit integer to unsigned 64-bit representation.
+    This follows C's two's complement semantics.
+    
     Args:
-        i: Signed integer
+        i: Signed integer (may be negative)
     
     Returns:
-        Unsigned integer (Python int handles this naturally)
+        Unsigned 64-bit integer representation
     """
-    if i < 0:
-        # Convert to unsigned 64-bit representation
-        return i + (1 << 64)
-    return i
+    # Mask to 64 bits to handle Python's arbitrary precision
+    return i & _LUA_UNSIGNED_MAX
 
 
 def l_castU2S(i: int) -> int:
     """
     llimits.h:131 - cast a lua_Unsigned to a signed lua_Integer
+    
+    #define l_castU2S(i) ((lua_Integer)(i))
+    
     This cast is not strict ISO C, but two-complement architectures 
     should work fine.
     
+    Converts unsigned 64-bit integer to signed 64-bit representation.
+    If the high bit (bit 63) is set, the result is negative.
+    
     Args:
-        i: Unsigned integer
+        i: Unsigned 64-bit integer
     
     Returns:
-        Signed integer
+        Signed 64-bit integer (two's complement)
     """
-    # If the high bit is set, it's a negative number in two's complement
-    if i >= (1 << 63):
-        return i - (1 << 64)
+    # First ensure we're working with 64-bit unsigned
+    i = i & _LUA_UNSIGNED_MAX
+    # If bit 63 is set, convert to negative
+    if i > _LUA_INTEGER_MAX:
+        return i - (1 << _LUA_INTEGER_BITS)
     return i
 
 

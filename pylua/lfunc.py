@@ -13,9 +13,9 @@ from dataclasses import dataclass, field
 
 from .llimits import lu_byte, cast_byte, lua_assert
 from .lobject import (
-    GCObject, TValue, Proto, LClosure, CClosure, UpVal,
+    GCObject, TValue, Proto, LClosure, CClosure, UpVal, UpValRef,
     LUA_TPROTO, LUA_TLCL, LUA_TCCL,
-    setnilvalue, setobj, getstr,
+    setnilvalue, setobj, getstr, upisopen,
 )
 
 if TYPE_CHECKING:
@@ -52,13 +52,7 @@ def sizeLclosure(n: int) -> int:
 # =============================================================================
 # UpVal is defined in lobject.py, but we include the key macro here
 
-def upisopen(up: UpVal) -> bool:
-    """
-    lfunc.h:47 - #define upisopen(up) ((up)->v != &(up)->u.value)
-    Check if upvalue is open (pointing to stack)
-    Source: lfunc.h:47
-    """
-    return up.v is not up.value
+# upisopen is now imported from lobject.py
 
 
 # =============================================================================
@@ -184,29 +178,41 @@ def luaF_findupval(L: 'LuaState', level: int) -> UpVal:
     """
     from .lstate import G
     
-    # Search existing open upvalues
+    # Helper to get stack index from upvalue
+    def get_stack_index(uv: UpVal) -> int:
+        if isinstance(uv.v, UpValRef):
+            return uv.v.stack_index if uv.v.is_open else -1
+        elif isinstance(uv.v, int):
+            return uv.v
+        return -1
+    
+    # Search existing open upvalues (sorted by descending stack index)
     pp = L.openupval  # Start of open upvalue list
     prev = None
     
     while pp is not None:
         p = pp
         lua_assert(upisopen(p))
-        # In Python, we compare stack indices directly
-        if p.v == level:  # Found a corresponding upvalue?
+        p_level = get_stack_index(p)
+        
+        # Found a corresponding upvalue?
+        if p_level == level:
             return p
-        if isinstance(p.v, int) and p.v < level:
+        # Passed the insertion point?
+        if p_level < level:
             break
+        
         prev = p
         pp = p.next
     
-    # Not found: create a new upvalue
+    # Not found: create a new upvalue with UpValRef wrapper
     uv = UpVal()
     uv.refcount = 0
     uv.next = pp  # Link it to list of open upvalues
     uv.touched = 1
-    uv.v = level  # Current value lives in the stack (as index)
+    uv.v = UpValRef.from_stack(level)  # Use UpValRef for type safety
     
-    # Insert into list
+    # Insert into list (sorted by descending stack index)
     if prev is None:
         L.openupval = uv
     else:
@@ -243,10 +249,20 @@ def luaF_close(L: 'LuaState', level: int) -> None:
     
     Source: lfunc.c:83-96
     """
+    # Helper to get stack index from upvalue
+    def get_stack_index(uv: UpVal) -> int:
+        if isinstance(uv.v, UpValRef):
+            return uv.v.stack_index if uv.v.is_open else -1
+        elif isinstance(uv.v, int):
+            return uv.v
+        return -1
+    
     while L.openupval is not None:
         uv = L.openupval
+        uv_level = get_stack_index(uv)
+        
         # Check if upvalue is at or above level
-        if isinstance(uv.v, int) and uv.v < level:
+        if uv_level < level:
             break
         
         lua_assert(upisopen(uv))
@@ -256,9 +272,10 @@ def luaF_close(L: 'LuaState', level: int) -> None:
             pass  # Free upvalue (Python GC handles this)
         else:
             # Move value from stack to upvalue's own storage
-            if isinstance(uv.v, int) and uv.v < len(L.stack):
-                setobj(L, uv.value, L.stack[uv.v])
-            uv.v = uv.value  # Now current value lives here (closed)
+            if uv_level >= 0 and uv_level < len(L.stack):
+                setobj(L, uv.value, L.stack[uv_level])
+            # Close the upvalue - now points to its own value
+            uv.v = UpValRef.from_tvalue(uv.value)
             # TODO: luaC_upvalbarrier(L, uv)
 
 

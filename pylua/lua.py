@@ -253,6 +253,34 @@ class LuaDebug:
 
 
 # =============================================================================
+# lua.h:382-391 - Debug Event Codes
+# =============================================================================
+
+LUA_HOOKCALL: int = 0     # lua.h:382 - call hook
+LUA_HOOKRET: int = 1      # lua.h:383 - return hook
+LUA_HOOKLINE: int = 2     # lua.h:384 - line hook
+LUA_HOOKCOUNT: int = 3    # lua.h:385 - count hook
+LUA_HOOKTAILCALL: int = 4  # lua.h:386 - tail call hook
+
+
+# =============================================================================
+# lua.h:393-398 - Hook Masks
+# =============================================================================
+
+LUA_MASKCALL: int = 1 << LUA_HOOKCALL    # lua.h:393
+LUA_MASKRET: int = 1 << LUA_HOOKRET      # lua.h:394
+LUA_MASKLINE: int = 1 << LUA_HOOKLINE    # lua.h:395
+LUA_MASKCOUNT: int = 1 << LUA_HOOKCOUNT  # lua.h:396
+
+
+# =============================================================================
+# luaconf.h:748 - Debug Source ID Size
+# =============================================================================
+
+LUA_IDSIZE: int = 60  # luaconf.h:748 - max size for source description
+
+
+# =============================================================================
 # lua.h:420 - Hook Function Type
 # =============================================================================
 

@@ -431,18 +431,154 @@ class Proto(GCObject):
 # =============================================================================
 # lfunc.h:35-47 / lobject.h:433-463 - Upvalues and Closures
 # =============================================================================
+
+class UpValRef:
+    """
+    Wrapper to hold either a stack index (int) or TValue reference.
+    
+    This solves the type inconsistency problem where uv.v can be either:
+    - An integer (stack index) when upvalue is open
+    - A TValue reference when upvalue is closed
+    
+    In C, this is done with pointer arithmetic. In Python, we use this wrapper.
+    """
+    __slots__ = ('_value', '_is_stack_index')
+    
+    def __init__(self, value=None, is_stack_index: bool = False):
+        self._value = value
+        self._is_stack_index = is_stack_index
+    
+    @property
+    def is_open(self) -> bool:
+        """True if this points to stack (open upvalue)"""
+        return self._is_stack_index
+    
+    @property
+    def stack_index(self) -> int:
+        """Get stack index (only valid if is_open)"""
+        if not self._is_stack_index:
+            raise ValueError("UpVal is closed, has no stack index")
+        return self._value
+    
+    @property
+    def tvalue(self) -> 'TValue':
+        """Get TValue (only valid if not is_open)"""
+        if self._is_stack_index:
+            raise ValueError("UpVal is open, use stack_index instead")
+        return self._value
+    
+    @staticmethod
+    def from_stack(index: int) -> 'UpValRef':
+        """Create an open upvalue reference pointing to stack index"""
+        return UpValRef(index, is_stack_index=True)
+    
+    @staticmethod
+    def from_tvalue(tv: 'TValue') -> 'UpValRef':
+        """Create a closed upvalue reference pointing to TValue"""
+        return UpValRef(tv, is_stack_index=False)
+    
+    def __eq__(self, other):
+        if isinstance(other, UpValRef):
+            return self._value == other._value and self._is_stack_index == other._is_stack_index
+        if isinstance(other, int) and self._is_stack_index:
+            return self._value == other
+        return False
+    
+    def __lt__(self, other):
+        """Compare for sorting open upvalues by stack index"""
+        if isinstance(other, UpValRef) and self._is_stack_index and other._is_stack_index:
+            return self._value < other._value
+        if isinstance(other, int) and self._is_stack_index:
+            return self._value < other
+        return False
+    
+    def __ge__(self, other):
+        return not self.__lt__(other)
+
+
 @dataclass
 class UpVal:
-    """lfunc.h:35-45 - Upvalues for Lua closures"""
-    v: Optional[TValue] = None   # lfunc.h:36 - points to stack or own value
+    """
+    lfunc.h:35-45 - Upvalues for Lua closures
+    
+    struct UpVal {
+        TValue *v;  /* points to stack or to its own value */
+        lu_mem refcount;  /* reference counter */
+        union {
+            struct {  /* (when open) */
+                UpVal *next;  /* linked list */
+                int touched;  /* mark to avoid cycles with dead threads */
+            } open;
+            TValue value;  /* the value (when closed) */
+        } u;
+    };
+    
+    In this Python implementation:
+    - v: Can be UpValRef (wrapping stack index or TValue) or legacy int/TValue
+    - value: The closed TValue storage
+    """
+    v: Any = None                # lfunc.h:36 - UpValRef, int, or TValue
     refcount: int = 0            # lfunc.h:37 - reference counter
     next: Optional['UpVal'] = None  # lfunc.h:40 - open: linked list
     touched: int = 0                # lfunc.h:41 - open: mark for cycles
     value: TValue = field(default_factory=TValue)  # lfunc.h:43 - closed: the value
 
+
 def upisopen(up: 'UpVal') -> bool:
-    """lfunc.h:47"""
+    """
+    lfunc.h:47 - #define upisopen(up) ((up)->v != &(up)->u.value)
+    
+    Check if upvalue is open (pointing to stack).
+    
+    Returns True if upvalue points to stack location, False if closed (points to own value).
+    """
+    # Handle UpValRef wrapper
+    if isinstance(up.v, UpValRef):
+        return up.v.is_open
+    # Legacy support: v is int means open, v is TValue/same as value means closed
+    if isinstance(up.v, int):
+        return True
     return up.v is not up.value
+
+
+def upval_get_value(L: 'LuaState', uv: 'UpVal') -> 'TValue':
+    """
+    Helper to get the actual TValue from an upvalue.
+    
+    For open upvalues, reads from stack at the stored index.
+    For closed upvalues, returns the stored value directly.
+    """
+    if isinstance(uv.v, UpValRef):
+        if uv.v.is_open:
+            return L.stack[uv.v.stack_index]
+        return uv.v.tvalue
+    elif isinstance(uv.v, int):
+        # Legacy: v is stack index
+        return L.stack[uv.v]
+    else:
+        # Legacy: v is TValue
+        return uv.v if uv.v is not None else uv.value
+
+
+def upval_set_value(L: 'LuaState', uv: 'UpVal', val: 'TValue') -> None:
+    """
+    Helper to set the value in an upvalue.
+    
+    For open upvalues, writes to stack at the stored index.
+    For closed upvalues, writes to the stored value.
+    """
+    if isinstance(uv.v, UpValRef):
+        if uv.v.is_open:
+            setobj(L, L.stack[uv.v.stack_index], val)
+        else:
+            setobj(L, uv.v.tvalue, val)
+    elif isinstance(uv.v, int):
+        # Legacy: v is stack index
+        setobj(L, L.stack[uv.v], val)
+    else:
+        # Legacy: v is TValue
+        target = uv.v if uv.v is not None else uv.value
+        setobj(L, target, val)
 
 @dataclass
 class CClosure(GCObject):
@@ -1029,3 +1165,141 @@ def _parse_hex_float(s: str) -> Optional[lua_Number]:
         return result
     except (ValueError, OverflowError):
         return None
+
+
+# =============================================================================
+# lobject.c:364-387 - luaO_tostring - Number to String Conversion
+# =============================================================================
+
+# lobject.c:365 - maximum length of the conversion of a number to a string
+MAXNUMBER2STR = 50
+
+
+def lua_integer2str(buff: bytearray, n: lua_Integer) -> int:
+    """
+    luaconf.h:525-527 - Convert integer to string
+    
+    #define lua_integer2str(s,sz,n)  \
+        l_sprintf((s), sz, LUA_INTEGER_FMT, (LUAI_UACINT)(n))
+    
+    Returns length of the string (not including null terminator).
+    """
+    s = str(n).encode('utf-8')
+    buff[:len(s)] = s
+    return len(s)
+
+
+def lua_number2str(buff: bytearray, n: lua_Number) -> int:
+    """
+    luaconf.h:494-496 - Convert float to string
+    
+    #define lua_number2str(s,sz,n)	l_sprintf((s), sz, LUA_NUMBER_FMT, (LUAI_UACNUMBER)(n))
+    
+    Uses %.14g format like Lua (LUA_NUMBER_FMT = "%.14g")
+    Returns length of the string.
+    
+    Source: luaconf.h:494-496
+    """
+    import math
+    
+    # Handle special cases
+    if math.isnan(n):
+        s = b'nan'
+    elif math.isinf(n):
+        s = b'-inf' if n < 0 else b'inf'
+    else:
+        # Use %.14g format to match Lua's LUA_NUMBER_FMT
+        # This gives us at most 14 significant digits
+        s = ("%.14g" % n).encode('utf-8')
+    
+    buff[:len(s)] = s
+    return len(s)
+
+
+def luaO_tostring(L: 'LuaState', obj: TValue) -> None:
+    """
+    lobject.c:371-387 - Convert a number object to a string
+    
+    void luaO_tostring (lua_State *L, StkId obj) {
+        char buff[MAXNUMBER2STR];
+        size_t len;
+        lua_assert(ttisnumber(obj));
+        if (ttisinteger(obj))
+            len = lua_integer2str(buff, sizeof(buff), ivalue(obj));
+        else {
+            len = lua_number2str(buff, sizeof(buff), fltvalue(obj));
+    #if !defined(LUA_COMPAT_FLOATSTRING)
+            if (buff[strspn(buff, "-0123456789")] == '\\0') {  /* looks like an int? */
+                buff[len++] = lua_getlocaledecpoint();
+                buff[len++] = '0';  /* adds '.0' to result */
+            }
+    #endif
+        }
+        setsvalue2s(L, obj, luaS_newlstr(L, buff, len));
+    }
+    
+    Source: lobject.c:371-387
+    """
+    from .lstring import luaS_newlstr
+    
+    lua_assert(ttisnumber(obj))
+    buff = bytearray(MAXNUMBER2STR)
+    
+    if ttisinteger(obj):
+        length = lua_integer2str(buff, ivalue(obj))
+    else:
+        length = lua_number2str(buff, fltvalue(obj))
+        # Check if result looks like an integer (no decimal point or exponent)
+        # lobject.c:380-383 - LUA_COMPAT_FLOATSTRING is not defined by default
+        s = buff[:length].decode('utf-8')
+        if _looks_like_int(s):
+            # Add '.0' to make it clear it's a float
+            buff[length] = ord('.')
+            buff[length + 1] = ord('0')
+            length += 2
+    
+    # Create string and set to obj
+    ts = luaS_newlstr(L, bytes(buff[:length]), length)
+    setsvalue2s(L, obj, ts)
+
+
+def _looks_like_int(s: str) -> bool:
+    """
+    lobject.c:380 - Check if string looks like integer
+    
+    buff[strspn(buff, "-0123456789")] == '\\0'
+    
+    Returns True if string contains only digits (possibly with leading '-')
+    """
+    valid_chars = set('-0123456789')
+    for c in s:
+        if c not in valid_chars:
+            return False
+    return True
+
+
+def luaO_num2str(n: lua_Number) -> str:
+    """
+    Convenience function to convert number to string (Lua format)
+    
+    Ensures floats that look like integers have '.0' appended.
+    """
+    import math
+    
+    if math.isnan(n):
+        return 'nan'
+    elif math.isinf(n):
+        return '-inf' if n < 0 else 'inf'
+    
+    s = "%.14g" % n
+    
+    # If it looks like an integer, add .0
+    if _looks_like_int(s):
+        s += '.0'
+    
+    return s
+
+
+def luaO_int2str(n: lua_Integer) -> str:
+    """Convenience function to convert integer to string"""
+    return str(n)
